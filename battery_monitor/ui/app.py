@@ -183,6 +183,21 @@ def midnight():
     return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
 
 
+def merge_apps(apps):
+    """Rows that resolve to the same app name (e.g. a scope and a process) become one."""
+    merged = {}
+    for a in apps:
+        name = names.describe(a.key)[0]
+        m = merged.get(name)
+        if m is None:
+            merged[name] = analysis.AppUse(a.key, a.cpu, a.share, a.energy)
+        else:
+            m.cpu += a.cpu
+            m.share += a.share
+            m.energy = (m.energy or 0) + (a.energy or 0) if m.energy is not None or a.energy is not None else None
+    return sorted(merged.values(), key=lambda a: a.cpu, reverse=True)
+
+
 def app_row(a, max_share, show_energy=True):
     name, icon, kind = names.describe(a.key)
     row = Adw.ActionRow(title=GLib.markup_escape_text(name))
@@ -426,6 +441,7 @@ class SessionDialog(Adw.Dialog):
             pw.set_default(f"avg {fmt_watts(s.avg_power)}" if s.avg_power else "")
             box.append(pw)
         apps, _ = analysis.app_usage(win.con, s.start, s.end, battery_only=s.battery_time > s.ac_time, samples=s.samples)
+        apps = merge_apps(apps)
         if apps:
             g = Adw.PreferencesGroup(title="Apps", description="Share of CPU time" + (" on battery" if s.battery_time > s.ac_time else ""))
             mx = max(a.share for a in apps)
@@ -535,6 +551,7 @@ class AppsPage(Page):
         since = now - dict(APP_RANGES)[self.range]
         samples = analysis.load_samples(self.con, since)
         apps, total = analysis.app_usage(self.con, since, battery_only=not self.all, samples=samples)
+        apps = merge_apps(apps)
         e, t, floor = analysis.battery_energy(samples)
         active = max(0.0, e - floor * t / 3600) if floor is not None else None
         self.tiles.set_tiles([

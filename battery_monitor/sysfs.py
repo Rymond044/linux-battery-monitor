@@ -283,6 +283,9 @@ def unit_key(kind, unit):
         if name.endswith(suf):
             name = name[: -len(suf)]
             break
+    if kind == "proc":
+        name = unit.rstrip("0123456789")
+        return "app:" + (name[:-1] if name.endswith("_") and name != unit else unit)
     if kind == "system":
         if name.startswith("docker-") and len(name) > 40:
             return "system:docker-containers"
@@ -308,6 +311,42 @@ def _cpu_usec(path):
         return None
 
 
+# Compositor units that also hold whatever its keybinds launched without a scope of their own.
+SPLIT_UNITS = ("wayland-wm", "session-")
+COMPOSITORS = {"Hyprland", "start-hyprland", "Xwayland", "sway", "niri", "labwc", "river", "wayfire",
+               "kwin_wayland", "gnome-shell", "uwsm", "systemd"}
+
+
+def _proc(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            data = f.read()
+    except OSError:
+        return None
+    lp, rp = data.find("("), data.rfind(")")
+    rest = data[rp + 2:].split()
+    return data[lp + 1:rp], int(rest[1]), int(rest[11]) + int(rest[12])  # comm, ppid, utime+stime
+
+
+def _split(path, kind, unit, out):
+    """Per-app CPU inside a compositor cgroup: each process counts toward its topmost ancestor below the compositor."""
+    try:
+        with open(path + "/cgroup.procs") as f:
+            pids = [int(x) for x in f.read().split()]
+    except (OSError, ValueError):
+        return False
+    procs = {p: info for p in pids if (info := _proc(p))}
+    k = 1_000_000 // CLK_TCK
+    for pid, (comm, ppid, ticks) in procs.items():
+        top = pid
+        while procs.get(top) and procs[top][1] in procs and procs[procs[top][1]][0] not in COMPOSITORS:
+            top = procs[top][1]
+        name = procs[top][0]
+        key = (kind, unit) if name in COMPOSITORS else ("proc", name)
+        out[key] = out.get(key, 0) + ticks * k
+    return True
+
+
 def _leaves(path, kind, out):
     try:
         it = os.scandir(path)
@@ -323,6 +362,8 @@ def _leaves(path, kind, out):
             elif n.endswith((".scope", ".service")):
                 # A unit with its own children (e.g. user@.service) is descended into instead.
                 if n.startswith("user@"):
+                    continue
+                if n.startswith(SPLIT_UNITS) and _split(e.path, kind, n, out):
                     continue
                 u = _cpu_usec(e.path)
                 if u is not None:
@@ -342,6 +383,13 @@ def cgroup_usage():
                 u = _cpu_usec(e.path)
                 if u is not None:
                     out[("user", e.name)] = u
+    except OSError:
+        pass
+    # sessions started without a systemd user manager (e.g. a compositor run straight from a tty)
+    try:
+        for e in os.scandir(f"{CGROUP}/user.slice/user-{uid}.slice"):
+            if e.name.startswith("session-") and e.name.endswith(".scope"):
+                _split(e.path, "user", e.name, out)
     except OSError:
         pass
     _leaves(f"{CGROUP}/system.slice", "system", out)
